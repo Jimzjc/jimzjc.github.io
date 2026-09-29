@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deckly – Flashcards</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;500;700&display=swap" rel="stylesheet">
+<script>
+  // Tailwind: enable class-based dark mode, add our font + accent colors
+  tailwind.config = {
+    darkMode: 'class',
+    theme: { extend: {
+      fontFamily: { sans: ['"Bricolage Grotesque"', 'system-ui', 'sans-serif'] },
+      colors: { brand: { DEFAULT: '#0f766e', light: '#2dd4bf' } }
+    } }
+  };
+  // Apply saved theme BEFORE first paint to avoid a flash
+  (function () {
+    try {
+      const t = localStorage.getItem('deckly:theme');
+      const dark = t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.classList.toggle('dark', dark);
+    } catch (e) {}
+  })();
+</script>
+<style>
+  /* 3D flip card */
+  .scene { perspective: 1200px; }
+  .card { transform-style: preserve-3d; transition: transform .55s cubic-bezier(.4,.2,.2,1); }
+  .card.flipped { transform: rotateY(180deg); }
+  .face { backface-visibility: hidden; -webkit-backface-visibility: hidden; }
+  .back { transform: rotateY(180deg); }
+  @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
+</style>
+</head>
+<body class="font-sans bg-[#f2f6f4] text-[#14231e] dark:bg-[#0d1512] dark:text-[#e6f0ec] min-h-screen transition-colors">
+
+<header class="sticky top-0 z-10 backdrop-blur bg-[#f2f6f4]/85 dark:bg-[#0d1512]/85 border-b border-black/10 dark:border-white/10">
+  <div class="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
+    <button id="home" class="flex items-center gap-2 text-xl font-bold tracking-tight hover:text-brand dark:hover:text-brand-light transition-colors">
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="14" rx="2"/><path d="M7 3h12a2 2 0 0 1 2 2v12"/></svg>
+      Deckly
+    </button>
+    <button id="theme" aria-label="Toggle dark mode" class="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 transition-colors">
+      <svg class="w-5 h-5 dark:hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="app" class="max-w-4xl mx-auto px-4 py-8"></main>
+
+<script>
+/* =====================================================================
+   DATA PERSISTENCE (localStorage)
+   ---------------------------------------------------------------------
+   localStorage stores only STRINGS, per browser and per site. So:
+     • SAVE: convert our decks array to a JSON string -> setItem(key, str)
+     • LOAD: getItem(key) -> JSON.parse back into an array
+   We call saveDecks() after every change (create, edit, delete), so data
+   is always up to date and survives page refreshes and browser restarts.
+   Everything is wrapped in try/catch because localStorage can throw
+   (private browsing, storage full, blocked by settings). If it fails,
+   the app keeps working in memory for the session.
+   ===================================================================== */
+const KEY = 'deckly:decks';
+
+function loadDecks() {
+  try {
+    const raw = localStorage.getItem(KEY);      // null if nothing saved yet
+    return raw ? JSON.parse(raw) : [];          // string -> array
+  } catch (e) {
+    console.warn('Could not read saved decks:', e);
+    return [];
+  }
+}
+
+function saveDecks() {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(decks)); // array -> string
+  } catch (e) {
+    alert('Could not save: browser storage is full or disabled.');
+  }
+}
+
+/* ---------- App state ---------- */
+let decks = loadDecks();     // each deck: {id, title, cards, folderId, modified}
+
+/* Folders live under their own localStorage key. A deck points to its folder
+   through deck.folderId (null = not in a folder), so moving a deck is just
+   changing that one field and saving. deck.modified is a timestamp (ms)
+   refreshed on every save; it powers the "Date modified" sort. */
+const FKEY = 'deckly:folders';
+function loadFolders() {
+  try { return JSON.parse(localStorage.getItem(FKEY)) || []; } catch (e) { return []; }
+}
+function saveFolders() {
+  try { localStorage.setItem(FKEY, JSON.stringify(folders)); }
+  catch (e) { alert('Could not save: browser storage is full or disabled.'); }
+}
+let folders = loadFolders(); // each folder: {id, name, created}
+let currentFolder = null;    // folder id being viewed (null = top level)
+// The chosen sort order is remembered too ('modified' or 'az')
+let sort = (() => { try { return localStorage.getItem('deckly:sort') || 'modified'; } catch (e) { return 'modified'; } })();
+let view = 'dashboard';     // 'dashboard' | 'editor' | 'study'
+let editingId = null;       // deck being edited (null = new deck)
+let studyDeck = null;       // deck being studied
+let idx = 0;                // current card index
+
+const $app = document.getElementById('app');
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+/* Reusable styles */
+const btnPrimary = 'inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-brand text-white font-medium hover:bg-teal-800 active:scale-[.98] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-light';
+const btnGhost = 'inline-flex items-center gap-2 px-4 py-2.5 rounded-lg border border-black/15 dark:border-white/15 font-medium hover:bg-black/5 dark:hover:bg-white/10 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-light';
+const input = 'w-full px-3 py-2.5 rounded-lg bg-white dark:bg-[#16211d] border border-black/15 dark:border-white/15 focus:outline-none focus:ring-2 focus:ring-brand/60 placeholder:text-black/35 dark:placeholder:text-white/30';
+const icon = {
+  plus: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  trash: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>',
+  edit: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+  left: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>',
+  right: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>',
+  play: '<svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg>',
+  shuffle: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>'
+};
+
+/* ---------- Router ---------- */
+function render() {
+  ({ dashboard: renderDashboard, editor: renderEditor, study: renderStudy })[view]();
+  window.scrollTo(0, 0);
+}
+function go(v) { view = v; render(); }
+
+/* ---------- Dashboard ---------- */
+icon.folder = '<svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+
+// Sort a list either A-Z by a name field, or newest-first by a timestamp field
+function sortItems(list, nameKey, dateKey) {
+  return [...list].sort(sort === 'az'
+    ? (x, y) => x[nameKey].localeCompare(y[nameKey], undefined, { sensitivity: 'base' })
+    : (x, y) => (y[dateKey] || 0) - (x[dateKey] || 0));
+}
+// A folder counts as modified when it was created or any deck inside it was saved
+const folderModified = f => Math.max(f.created || 0, ...decks.filter(d => d.folderId === f.id).map(d => d.modified || 0));
+const fmtDate = t => t ? new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
+
+function deckCard(d) {
+  return `<article class="rounded-2xl bg-white dark:bg-[#16211d] border border-black/10 dark:border-white/10 p-5 hover:border-brand dark:hover:border-brand-light hover:-translate-y-0.5 transition">
+    <h3 class="text-lg font-bold truncate">${esc(d.title)}</h3>
+    <p class="text-sm opacity-60 mt-1">${d.cards.length} card${d.cards.length === 1 ? '' : 's'}${d.modified ? ' · edited ' + fmtDate(d.modified) : ''}</p>
+    <div class="mt-5 flex items-center gap-2">
+      <button data-study="${d.id}" class="${btnPrimary} !py-2">${icon.play} Study</button>
+      <button data-edit="${d.id}" aria-label="Edit deck" class="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 transition">${icon.edit}</button>
+      <button data-del="${d.id}" aria-label="Delete deck" class="p-2 rounded-lg hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400 transition ml-auto">${icon.trash}</button>
+    </div>
+  </article>`;
+}
+
+function folderCard(f) {
+  const n = decks.filter(d => d.folderId === f.id).length;
+  return `<div data-open="${f.id}" tabindex="0" role="link" class="cursor-pointer rounded-2xl bg-white dark:bg-[#16211d] border border-black/10 dark:border-white/10 p-4 flex items-center gap-3 hover:border-brand dark:hover:border-brand-light hover:-translate-y-0.5 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-light">
+    <span class="text-brand dark:text-brand-light">${icon.folder}</span>
+    <div class="min-w-0 flex-1">
+      <h3 class="font-bold truncate">${esc(f.name)}</h3>
+      <p class="text-sm opacity-60">${n} deck${n === 1 ? '' : 's'}</p>
+    </div>
+    <button data-rename="${f.id}" aria-label="Rename folder" class="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 transition">${icon.edit}</button>
+    <button data-delfolder="${f.id}" aria-label="Delete folder" class="p-2 rounded-lg hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400 transition">${icon.trash}</button>
+  </div>`;
+}
+
+function renderDashboard() {
+  const folder = folders.find(f => f.id === currentFolder);
+  if (currentFolder && !folder) currentFolder = null;
+  const deckList = sortItems(decks.filter(d => (d.folderId || null) === currentFolder), 'title', 'modified');
+  const folderList = currentFolder ? [] : sortItems(folders.map(f => ({ ...f, mod: folderModified(f) })), 'name', 'mod');
+  const empty = !deckList.length && !folderList.length;
+
+  $app.innerHTML = `
+    ${folder ? `<button data-up class="${btnGhost} !py-2 mb-4">${icon.left} All decks</button>` : ''}
+    <div class="flex items-end justify-between gap-4 mb-6 flex-wrap">
+      <div><h1 class="text-3xl sm:text-4xl font-bold tracking-tight break-words">${folder ? esc(folder.name) : 'Your decks'}</h1>
+      <p class="opacity-60 mt-1">${folder ? deckList.length + ' deck' + (deckList.length === 1 ? '' : 's') + ' in this folder' : 'Saved on this device'}</p></div>
+      <div class="flex gap-2 flex-wrap">
+        ${folder ? '' : `<button data-newfolder class="${btnGhost}">${icon.folder.replace('w-6 h-6', 'w-5 h-5')} New folder</button>`}
+        <button data-new class="${btnPrimary}">${icon.plus} Create new deck</button>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 mb-6">
+      <label for="sort" class="text-sm opacity-60">Sort by</label>
+      <select id="sort" class="${input} !w-auto !py-1.5">
+        <option value="modified" ${sort === 'modified' ? 'selected' : ''}>Date modified</option>
+        <option value="az" ${sort === 'az' ? 'selected' : ''}>A to Z</option>
+      </select>
+    </div>
+    ${folderList.length ? `<div class="grid gap-3 sm:grid-cols-2 mb-6">${folderList.map(folderCard).join('')}</div>` : ''}
+    ${deckList.length ? `<div class="grid gap-4 sm:grid-cols-2">${deckList.map(deckCard).join('')}</div>` : ''}
+    ${empty ? `<div class="text-center py-20 rounded-2xl border-2 border-dashed border-black/15 dark:border-white/15">
+        <p class="text-lg font-medium">${folder ? 'This folder is empty' : 'No decks yet'}</p>
+        <p class="opacity-60 mt-1">${folder ? 'Create a deck here, or move an existing one in when you edit it.' : 'Create your first deck or folder to get started.'}</p></div>` : ''}`;
+
+  const q = sel => $app.querySelectorAll(sel);
+  q('[data-up]').forEach(b => b.onclick = () => { currentFolder = null; render(); });
+  document.getElementById('sort').onchange = e => {
+    sort = e.target.value;
+    try { localStorage.setItem('deckly:sort', sort); } catch (err) {}
+    render();
+  };
+  q('[data-newfolder]').forEach(b => b.onclick = () => {
+    const name = (prompt('Folder name') || '').trim();
+    if (!name) return;
+    folders.push({ id: uid(), name, created: Date.now() });
+    saveFolders();
+    render();
+  });
+  q('[data-open]').forEach(el => {
+    const open = e => { if (e.target.closest('button')) return; currentFolder = el.dataset.open; render(); };
+    el.onclick = open;
+    el.onkeydown = e => { if (e.key === 'Enter') open(e); };
+  });
+  q('[data-rename]').forEach(b => b.onclick = () => {
+    const f = folders.find(x => x.id === b.dataset.rename);
+    const name = (prompt('Rename folder', f.name) || '').trim();
+    if (!name) return;
+    f.name = name;
+    saveFolders();
+    render();
+  });
+  q('[data-delfolder]').forEach(b => b.onclick = () => {
+    const f = folders.find(x => x.id === b.dataset.delfolder);
+    if (!confirm(`Delete folder "${f.name}"? Its decks will be kept and moved to your main list.`)) return;
+    decks.forEach(d => { if (d.folderId === f.id) d.folderId = null; });
+    folders = folders.filter(x => x.id !== f.id);
+    saveDecks(); saveFolders();
+    render();
+  });
+  q('[data-new]').forEach(b => b.onclick = () => { editingId = null; go('editor'); });
+  q('[data-edit]').forEach(b => b.onclick = () => { editingId = b.dataset.edit; go('editor'); });
+  q('[data-study]').forEach(b => b.onclick = () => {
+    studyDeck = decks.find(d => d.id === b.dataset.study);
+    if (!studyDeck.cards.length) return alert('This deck has no cards yet. Edit it to add some.');
+    idx = 0; go('study');
+  });
+  q('[data-del]').forEach(b => b.onclick = () => {
+    const d = decks.find(x => x.id === b.dataset.del);
+    if (confirm(`Delete "${d.title}"? This can't be undone.`)) {
+      decks = decks.filter(x => x.id !== d.id);
+      saveDecks();            // persist the deletion
+      render();
+    }
+  });
+}
+
+/* ---------- Deck editor ---------- */
+function rowHTML(t = '', df = '') {
+  return `<div class="row grid grid-cols-[1fr_auto] gap-2 p-3 rounded-xl bg-white dark:bg-[#16211d] border border-black/10 dark:border-white/10">
+    <div class="grid sm:grid-cols-2 gap-2">
+      <input class="${input} term" placeholder="Term" value="${esc(t)}">
+      <input class="${input} def" placeholder="Definition" value="${esc(df)}">
+    </div>
+    <button type="button" class="rm p-2 self-center rounded-lg hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400 transition" aria-label="Remove row">${icon.trash}</button>
+  </div>`;
+}
+
+function renderEditor() {
+  const deck = decks.find(d => d.id === editingId);
+  const cards = deck ? deck.cards : [{ term: '', definition: '' }, { term: '', definition: '' }, { term: '', definition: '' }];
+  $app.innerHTML = `
+    <h1 class="text-3xl font-bold tracking-tight mb-6">${deck ? 'Edit deck' : 'New deck'}</h1>
+    <label class="block text-sm font-medium mb-1" for="title">Title or subject</label>
+    <input id="title" class="${input} text-lg mb-4" placeholder="e.g. Spanish – Food vocabulary" value="${deck ? esc(deck.title) : ''}">
+    <label class="block text-sm font-medium mb-1" for="folder">Folder</label>
+    <select id="folder" class="${input} mb-8">
+      <option value="">No folder</option>
+      ${folders.map(f => `<option value="${f.id}" ${(deck ? deck.folderId : currentFolder) === f.id ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}
+    </select>
+    <div id="rows" class="space-y-3"></div>
+    <button id="add" type="button" class="${btnGhost} mt-4 w-full justify-center">${icon.plus} Add card</button>
+    <div class="flex gap-3 mt-8 justify-end">
+      <button id="cancel" class="${btnGhost}">Cancel</button>
+      <button id="save" class="${btnPrimary}">Save deck</button>
+    </div>`;
+
+  const rows = document.getElementById('rows');
+  const addRow = (t, d) => rows.insertAdjacentHTML('beforeend', rowHTML(t, d));
+  cards.forEach(c => addRow(c.term, c.definition));
+
+  // Event delegation: one listener handles every row's remove button
+  rows.onclick = e => {
+    const rm = e.target.closest('.rm');
+    if (rm) rm.closest('.row').remove();
+  };
+  document.getElementById('add').onclick = () => {
+    addRow();
+    rows.lastElementChild.querySelector('.term').focus();
+  };
+  document.getElementById('cancel').onclick = () => go('dashboard');
+  document.getElementById('save').onclick = () => {
+    const title = document.getElementById('title').value.trim();
+    // Read every row from the DOM, keep only rows where both fields are filled
+    const newCards = [...rows.querySelectorAll('.row')].map(r => ({
+      term: r.querySelector('.term').value.trim(),
+      definition: r.querySelector('.def').value.trim()
+    })).filter(c => c.term && c.definition);
+
+    if (!title) return alert('Please give your deck a title.');
+    if (!newCards.length) return alert('Add at least one card with both a term and a definition.');
+
+    const folderId = document.getElementById('folder').value || null;
+    const modified = Date.now();                                        // used by "Date modified" sort
+    if (deck) Object.assign(deck, { title, cards: newCards, folderId, modified }); // update existing
+    else decks.unshift({ id: uid(), title, cards: newCards, folderId, modified }); // add new
+    saveDecks();   // write the whole decks array to localStorage
+    go('dashboard');
+  };
+  document.getElementById('title').focus();
+}
+
+/* ---------- Study mode ---------- */
+function renderStudy() {
+  const total = studyDeck.cards.length;
+  $app.innerHTML = `
+    <div class="max-w-2xl mx-auto">
+      <div class="flex items-center justify-between mb-4">
+        <button id="back" class="${btnGhost} !py-2">${icon.left} Decks</button>
+        <button id="shuffle" class="${btnGhost} !py-2">${icon.shuffle} Shuffle</button>
+      </div>
+      <h1 class="text-xl font-bold truncate">${esc(studyDeck.title)}</h1>
+      <div class="h-1.5 rounded-full bg-black/10 dark:bg-white/10 my-3 overflow-hidden">
+        <div id="bar" class="h-full bg-brand dark:bg-brand-light transition-all duration-300"></div>
+      </div>
+      <p id="count" class="text-sm opacity-60 mb-4"></p>
+
+      <div class="scene">
+        <div id="card" role="button" tabindex="0" aria-label="Flip card" class="card relative h-72 sm:h-80 cursor-pointer select-none">
+          <div class="face absolute inset-0 rounded-3xl bg-white dark:bg-[#16211d] border border-black/10 dark:border-white/10 shadow-lg flex flex-col items-center justify-center p-8 text-center">
+            <span class="text-sm opacity-50 mb-3">Term</span>
+            <p id="front" class="text-2xl sm:text-3xl font-bold break-words max-w-full overflow-auto"></p>
+          </div>
+          <div class="face back absolute inset-0 rounded-3xl bg-brand text-white shadow-lg flex flex-col items-center justify-center p-8 text-center">
+            <span class="text-sm opacity-70 mb-3">Definition</span>
+            <p id="back-text" class="text-xl sm:text-2xl font-medium break-words max-w-full overflow-auto"></p>
+          </div>
+        </div>
+      </div>
+      <p class="text-center text-sm opacity-50 mt-4">Click the card or press Space to flip. Use ← → to navigate.</p>
+
+      <div class="flex justify-center gap-3 mt-6">
+        <button id="prev" class="${btnGhost}">${icon.left} Previous</button>
+        <button id="next" class="${btnPrimary}">Next ${icon.right}</button>
+      </div>
+    </div>`;
+
+  const card = document.getElementById('card');
+  const show = () => {
+    const c = studyDeck.cards[idx];
+    card.classList.remove('flipped');
+    document.getElementById('front').textContent = c.term;
+    document.getElementById('back-text').textContent = c.definition;
+    document.getElementById('count').textContent = `Card ${idx + 1} of ${total}`;
+    document.getElementById('bar').style.width = ((idx + 1) / total * 100) + '%';
+    document.getElementById('prev').disabled = idx === 0;
+    document.getElementById('next').disabled = idx === total - 1;
+    ['prev', 'next'].forEach(id => document.getElementById(id).classList.toggle('opacity-40', document.getElementById(id).disabled));
+  };
+  const move = n => { const j = idx + n; if (j >= 0 && j < total) { idx = j; show(); } };
+  const flip = () => card.classList.toggle('flipped');
+
+  card.onclick = flip;
+  document.getElementById('prev').onclick = () => move(-1);
+  document.getElementById('next').onclick = () => move(1);
+  document.getElementById('back').onclick = () => go('dashboard');
+  document.getElementById('shuffle').onclick = () => {
+    // Shuffle a COPY so the saved order in localStorage is untouched
+    studyDeck = { ...studyDeck, cards: [...studyDeck.cards].sort(() => Math.random() - 0.5) };
+    idx = 0; show();
+  };
+  show();
+}
+
+/* Keyboard shortcuts (only active in study mode) */
+document.addEventListener('keydown', e => {
+  if (view !== 'study' || /INPUT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight') document.getElementById('next').click();
+  else if (e.key === 'ArrowLeft') document.getElementById('prev').click();
+  else if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); document.getElementById('card').click(); }
+});
+
+/* Header controls */
+document.getElementById('home').onclick = () => { currentFolder = null; go('dashboard'); };
+document.getElementById('theme').onclick = () => {
+  const dark = document.documentElement.classList.toggle('dark');
+  try { localStorage.setItem('deckly:theme', dark ? 'dark' : 'light'); } catch (e) {}
+};
+
+render();
+</script>
+</body>
+</html>
