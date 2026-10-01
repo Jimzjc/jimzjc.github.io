@@ -46,10 +46,16 @@
       <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="14" rx="2"/><path d="M7 3h12a2 2 0 0 1 2 2v12"/></svg>
       JimNote
     </button>
+    <div class="flex items-center gap-1">
+    <button id="syncbtn" aria-label="Sync with GitHub" title="Sync with GitHub" class="flex items-center gap-1.5 p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 transition-colors">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.6-7.96A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z"/></svg>
+      <span class="hidden sm:inline text-sm font-medium">Sync</span>
+    </button>
     <button id="theme" aria-label="Toggle dark mode" class="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 transition-colors">
       <svg class="w-5 h-5 dark:hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
       <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
     </button>
+    </div>
   </div>
 </header>
 
@@ -83,6 +89,7 @@ function loadDecks() {
 }
 
 function saveDecks() {
+  scheduleSync();
   try {
     localStorage.setItem(KEY, JSON.stringify(decks)); // array -> string
   } catch (e) {
@@ -102,6 +109,7 @@ function loadFolders() {
   try { return JSON.parse(localStorage.getItem(FKEY)) || []; } catch (e) { return []; }
 }
 function saveFolders() {
+  scheduleSync();
   try { localStorage.setItem(FKEY, JSON.stringify(folders)); }
   catch (e) { alert('Could not save: browser storage is full or disabled.'); }
 }
@@ -132,6 +140,130 @@ const icon = {
   shuffle: '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>'
 };
 
+/* ---------- GitHub gist sync ----------
+   Optional. You paste a GitHub token once; the app then keeps all decks and
+   folders in ONE private gist (file jimnote-data.json) on your account.
+   On load, on every save, and when you return to the tab it:
+     1. downloads the gist and MERGES it with local data (per deck/folder,
+        whichever was modified last wins),
+     2. uploads the merged result.
+   Deletions are remembered as "tombstones" (id + time) so a deleted deck is
+   not resurrected by another device. The token lives only in this browser's
+   localStorage; it is never part of this file. */
+const SKEY = 'deckly:sync', TKEY = 'deckly:tomb', SYNC_FILE = 'jimnote-data.json';
+let tomb = (() => { try { const t = JSON.parse(localStorage.getItem(TKEY)); return { d: (t && t.d) || {}, f: (t && t.f) || {} }; } catch (e) { return { d: {}, f: {} }; } })();
+const saveTomb = () => { try { localStorage.setItem(TKEY, JSON.stringify(tomb)); } catch (e) {} };
+const getSync = () => { try { const c = JSON.parse(localStorage.getItem(SKEY)); return c && c.token ? c : null; } catch (e) { return null; } };
+const setSync = c => { try { c ? localStorage.setItem(SKEY, JSON.stringify(c)) : localStorage.removeItem(SKEY); } catch (e) {} };
+let syncing = false, syncTimer = null, syncMsg = '';
+
+function setMsg(m) { syncMsg = m; const el = document.getElementById('sync-msg'); if (el) el.textContent = m; }
+function scheduleSync() {                       // called after every local save (debounced)
+  if (syncing || !getSync()) return;
+  clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, 1500);
+}
+
+async function gh(path, opts = {}) {
+  const res = await fetch('https://api.github.com' + path, { ...opts, headers: {
+    Authorization: 'Bearer ' + getSync().token, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' } });
+  if (res.status === 401) throw new Error('GitHub rejected the token. Create a new classic token with the "gist" permission.');
+  if (res.status === 404) throw new Error('Gist not found. Check the gist ID, and that the token is from the same GitHub account.');
+  if (!res.ok) throw new Error('GitHub error ' + res.status);
+  return res.json();
+}
+
+// Rebuild records from known fields only, so a bad file can't inject junk
+function cleanData(data) {
+  const isCard = c => c && typeof c.term === 'string' && typeof c.definition === 'string';
+  return {
+    decks: (data.decks || []).filter(d => d && typeof d.title === 'string' && Array.isArray(d.cards)).map(d => ({
+      id: String(d.id || uid()), title: d.title, folderId: d.folderId || null, modified: +d.modified || 0,
+      cards: d.cards.filter(isCard).map(c => ({ term: c.term, definition: c.definition })) })),
+    folders: (data.folders || []).filter(f => f && typeof f.name === 'string').map(f => ({
+      id: String(f.id || uid()), name: f.name, created: +f.created || 0, modified: +f.modified || 0 }))
+  };
+}
+const itemTime = x => x.modified || x.created || 0;
+function mergeList(local, remote, key) {
+  const map = new Map(local.map(x => [x.id, x]));
+  remote.forEach(x => { const l = map.get(x.id); if (!l || itemTime(x) > itemTime(l)) map.set(x.id, x); });
+  return [...map.values()].filter(x => { const t = tomb[key][x.id]; return t === undefined || itemTime(x) > t; });
+}
+
+async function syncNow() {
+  const cfg = getSync();
+  if (!cfg || syncing) return;
+  syncing = true; setMsg('Syncing…');
+  try {
+    let remoteText = null;
+    if (cfg.gistId) {
+      const g = await gh('/gists/' + cfg.gistId);
+      const f = g.files && g.files[SYNC_FILE];
+      if (f) {
+        remoteText = f.truncated ? await (await fetch(f.raw_url)).text() : f.content;
+        const r = JSON.parse(remoteText), rc = cleanData(r), rt = r.tomb || {};
+        ['d', 'f'].forEach(k => Object.entries(rt[k] || {}).forEach(([id, t]) => { tomb[k][id] = Math.max(tomb[k][id] || 0, +t || 0); }));
+        decks = mergeList(decks, rc.decks, 'd'); folders = mergeList(folders, rc.folders, 'f');
+        decks.forEach(d => { if (d.folderId && !folders.some(x => x.id === d.folderId)) d.folderId = null; });
+        saveDecks(); saveFolders(); saveTomb();
+      }
+    }
+    const content = JSON.stringify({ app: 'JimNote', decks, folders, tomb });
+    if (content !== remoteText) {
+      const body = JSON.stringify({ description: 'JimNote data', public: false, files: { [SYNC_FILE]: { content } } });
+      if (cfg.gistId) await gh('/gists/' + cfg.gistId, { method: 'PATCH', body });
+      else cfg.gistId = (await gh('/gists', { method: 'POST', body })).id;   // first sync creates a private gist
+    }
+    cfg.last = Date.now(); setSync(cfg);
+    setMsg('Synced at ' + new Date(cfg.last).toLocaleTimeString());
+    const gi = document.getElementById('sync-gist'); if (gi) gi.value = cfg.gistId;
+    if (view === 'dashboard') render();   // never re-render while editing a form
+  } catch (e) { setMsg(e.message || 'Sync failed'); }
+  finally { syncing = false; }
+}
+
+function openSync() {
+  const cfg = getSync() || {};
+  const wrap = document.createElement('div');
+  wrap.className = 'fixed inset-0 z-50 bg-black/50 flex items-end sm:items-center justify-center sm:p-4';
+  wrap.innerHTML = `
+    <div role="dialog" aria-modal="true" aria-label="Sync with GitHub" class="w-full sm:max-w-lg max-h-[92vh] overflow-auto rounded-t-2xl sm:rounded-2xl bg-[#f2f6f4] dark:bg-[#0d1512] border border-black/10 dark:border-white/10 p-5 shadow-2xl">
+      <div class="flex items-start justify-between gap-4 mb-2">
+        <h2 class="text-xl font-bold">Sync with GitHub</h2>
+        <button id="sy-close" aria-label="Close" class="p-1.5 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 transition"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+      <p class="text-sm opacity-70 mb-4">Saves your decks to a private gist on your GitHub account so every device stays in step.</p>
+      <label class="block text-sm font-medium mb-1" for="sync-token">Personal access token (classic, “gist” permission)</label>
+      <input id="sync-token" type="password" autocomplete="off" class="${input}" placeholder="ghp_…" value="${esc(cfg.token || '')}">
+      <a href="https://github.com/settings/tokens/new?description=JimNote&scopes=gist" target="_blank" rel="noopener" class="text-sm underline hover:text-brand dark:hover:text-brand-light">Create a token on GitHub</a>
+      <label class="block text-sm font-medium mt-4 mb-1" for="sync-gist">Gist ID</label>
+      <input id="sync-gist" autocomplete="off" class="${input}" placeholder="Leave blank on your first device" value="${esc(cfg.gistId || '')}">
+      <p class="text-xs opacity-60 mt-1">On your other devices, paste the same token and this gist ID.</p>
+      <p id="sync-msg" class="text-sm font-medium mt-4 min-h-[1.25rem]">${esc(syncMsg)}</p>
+      <div class="flex flex-wrap justify-end gap-3 mt-4">
+        ${cfg.token ? `<button id="sy-off" class="${btnGhost}">Disconnect</button>` : ''}
+        <button id="sy-go" class="${btnPrimary}">Save &amp; sync now</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  const $ = sel => wrap.querySelector(sel);
+  const close = () => { wrap.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = e => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  wrap.addEventListener('mousedown', e => { if (e.target === wrap) close(); });
+  $('#sy-close').onclick = close;
+  $('#sy-go').onclick = () => {
+    const token = $('#sync-token').value.trim();
+    if (!token) return setMsg('Paste your GitHub token first.');
+    const gistId = $('#sync-gist').value.trim().split('/').pop();   // also accepts a full gist URL
+    setSync({ token, gistId, last: cfg.last });
+    cfg.token = token;
+    syncNow();
+  };
+  const off = $('#sy-off');
+  if (off) off.onclick = () => { setSync(null); setMsg('Disconnected. Your decks stay on this device.'); close(); };
+}
+
 /* ---------- Router ---------- */
 function render() {
   ({ dashboard: renderDashboard, editor: renderEditor, study: renderStudy, quiz: renderQuiz })[view]();
@@ -161,8 +293,8 @@ icon.download = '<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-w
 const clean = t => String(t).replace(/\s+/g, ' ').trim();
 const cardLines = d => d.cards.map(c => clean(c.term) + '\t' + clean(c.definition)).join('\n');
 
-function downloadTxt(filename, text) {
-  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+function downloadTxt(filename, text, type = 'text/plain') {
+  const url = URL.createObjectURL(new Blob([text], { type: type + ';charset=utf-8' }));
   const a = document.createElement('a');
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click(); a.remove();
@@ -180,6 +312,47 @@ function exportAll() {
     section('No folder', decks.filter(d => !d.folderId))
   ].filter(Boolean);
   downloadTxt('jimnote-all-decks.txt', parts.join('\n\n\n') + '\n');
+}
+
+/* ---------- Backup & restore ----------
+   Browsers wipe localStorage when you clear "cookies and site data", and a
+   web page cannot prevent that. The fix is a copy OUTSIDE the browser:
+   "Back up" saves all decks + folders to a .json file; "Restore" reads one
+   back and MERGES it in (decks/folders already present are never duplicated
+   or overwritten). */
+const LBKEY = 'deckly:lastbackup';
+const lastBackup = () => { try { return +localStorage.getItem(LBKEY) || 0; } catch (e) { return 0; } };
+
+function backupAll() {
+  const data = { app: 'JimNote', version: 1, exported: Date.now(), decks, folders };
+  downloadTxt(`jimnote-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), 'application/json');
+  try { localStorage.setItem(LBKEY, String(Date.now())); } catch (e) {}
+  render();
+}
+
+function restoreFrom(file) {
+  const rd = new FileReader();
+  rd.onload = () => {
+    try {
+      const data = JSON.parse(rd.result);
+      const isCard = c => c && typeof c.term === 'string' && typeof c.definition === 'string';
+      // Re-build every record from known fields only, so a bad file can't inject junk
+      const inDecks = (data.decks || []).filter(d => d && typeof d.title === 'string' && Array.isArray(d.cards)).map(d => ({
+        id: String(d.id || uid()), title: d.title, folderId: d.folderId || null, modified: +d.modified || 0,
+        cards: d.cards.filter(isCard).map(c => ({ term: c.term, definition: c.definition }))
+      }));
+      const inFolders = (data.folders || []).filter(f => f && typeof f.name === 'string')
+        .map(f => ({ id: String(f.id || uid()), name: f.name, created: +f.created || 0 }));
+      const haveD = new Set(decks.map(d => d.id)), haveF = new Set(folders.map(f => f.id));
+      const newD = inDecks.filter(d => !haveD.has(d.id)), newF = inFolders.filter(f => !haveF.has(f.id));
+      decks = [...decks, ...newD]; folders = [...folders, ...newF];
+      decks.forEach(d => { if (d.folderId && !folders.some(f => f.id === d.folderId)) d.folderId = null; });
+      saveDecks(); saveFolders();
+      alert(`Restored ${newD.length} deck${newD.length === 1 ? '' : 's'} and ${newF.length} folder${newF.length === 1 ? '' : 's'}.`);
+      render();
+    } catch (e) { alert('That file could not be read. Choose a .json backup made by JimNote.'); }
+  };
+  rd.readAsText(file);
 }
 
 function deckCard(d) {
@@ -226,19 +399,25 @@ function renderDashboard() {
         <button data-new class="${btnPrimary}">${icon.plus} Create new deck</button>
       </div>
     </div>
-    <div class="flex items-center gap-2 mb-6">
+    <div class="flex flex-wrap items-center gap-2 mb-6">
       <label for="sort" class="text-sm opacity-60">Sort by</label>
       <select id="sort" class="${input} !w-auto !py-1.5">
         <option value="modified" ${sort === 'modified' ? 'selected' : ''}>Date modified</option>
         <option value="az" ${sort === 'az' ? 'selected' : ''}>A to Z</option>
       </select>
-      ${decks.length ? `<button id="exportall" class="${btnGhost} !py-1.5 ml-auto">${icon.download} Export all (.txt)</button>` : ''}
+      <div class="flex flex-wrap gap-2 ml-auto">
+        ${decks.length ? `<button id="exportall" class="${btnGhost} !py-1.5">${icon.download} Export all (.txt)</button>
+        <button id="backup" class="${btnGhost} !py-1.5">${icon.download} Back up</button>` : ''}
+        <button data-restore class="${btnGhost} !py-1.5">${icon.upload} Restore</button>
+      </div>
     </div>
+    <input type="file" id="restorefile" accept=".json,application/json" class="hidden">
+    ${decks.length ? `<p class="text-xs opacity-60 -mt-3 mb-5">Clearing browser data deletes your decks. Last backup: ${lastBackup() ? fmtDate(lastBackup()) : 'never'}.</p>` : ''}
     ${folderList.length ? `<div class="grid gap-3 sm:grid-cols-2 mb-6">${folderList.map(folderCard).join('')}</div>` : ''}
     ${deckList.length ? `<div class="grid gap-4 sm:grid-cols-2">${deckList.map(deckCard).join('')}</div>` : ''}
     ${empty ? `<div class="text-center py-20 rounded-2xl border-2 border-dashed border-black/15 dark:border-white/15">
         <p class="text-lg font-medium">${folder ? 'This folder is empty' : 'No decks yet'}</p>
-        <p class="opacity-60 mt-1">${folder ? 'Create a deck here, or move an existing one in when you edit it.' : 'Create your first deck or folder to get started.'}</p></div>` : ''}`;
+        <p class="opacity-60 mt-1">${folder ? 'Create a deck here, or move an existing one in when you edit it.' : 'Create your first deck or folder to get started.'}</p>${folder ? '' : `<p class="text-sm opacity-60 mt-4">Cleared your browser data? <button data-restore class="underline hover:text-brand dark:hover:text-brand-light">Restore from a backup file</button></p>`}</div>` : ''}`;
 
   const q = sel => $app.querySelectorAll(sel);
   q('[data-up]').forEach(b => b.onclick = () => { currentFolder = null; render(); });
@@ -250,7 +429,7 @@ function renderDashboard() {
   q('[data-newfolder]').forEach(b => b.onclick = () => {
     const name = (prompt('Folder name') || '').trim();
     if (!name) return;
-    folders.push({ id: uid(), name, created: Date.now() });
+    folders.push({ id: uid(), name, created: Date.now(), modified: Date.now() });
     saveFolders();
     render();
   });
@@ -263,20 +442,26 @@ function renderDashboard() {
     const f = folders.find(x => x.id === b.dataset.rename);
     const name = (prompt('Rename folder', f.name) || '').trim();
     if (!name) return;
-    f.name = name;
+    f.name = name; f.modified = Date.now();
     saveFolders();
     render();
   });
   q('[data-delfolder]').forEach(b => b.onclick = () => {
     const f = folders.find(x => x.id === b.dataset.delfolder);
     if (!confirm(`Delete folder "${f.name}"? Its decks will be kept and moved to your main list.`)) return;
-    decks.forEach(d => { if (d.folderId === f.id) d.folderId = null; });
+    decks.forEach(d => { if (d.folderId === f.id) { d.folderId = null; d.modified = Date.now(); } });
     folders = folders.filter(x => x.id !== f.id);
+    tomb.f[f.id] = Date.now(); saveTomb();   // remember the deletion so sync doesn't bring it back
     saveDecks(); saveFolders();
     render();
   });
   q('[data-quiz]').forEach(b => b.onclick = () => startQuiz(decks.find(d => d.id === b.dataset.quiz)));
   q('[data-export]').forEach(b => b.onclick = () => exportDeck(decks.find(d => d.id === b.dataset.export)));
+  const rf = document.getElementById('restorefile');
+  q('[data-restore]').forEach(b => b.onclick = () => rf.click());
+  rf.onchange = () => { if (rf.files[0]) restoreFrom(rf.files[0]); };
+  const bk = document.getElementById('backup');
+  if (bk) bk.onclick = backupAll;
   const ea = document.getElementById('exportall');
   if (ea) ea.onclick = exportAll;
   q('[data-new]').forEach(b => b.onclick = () => { editingId = null; go('editor'); });
@@ -290,6 +475,7 @@ function renderDashboard() {
     const d = decks.find(x => x.id === b.dataset.del);
     if (confirm(`Delete "${d.title}"? This can't be undone.`)) {
       decks = decks.filter(x => x.id !== d.id);
+      tomb.d[d.id] = Date.now(); saveTomb();   // remember the deletion so sync doesn't bring it back
       saveDecks();            // persist the deletion
       render();
     }
@@ -437,7 +623,8 @@ function renderEditor() {
 
     const folderId = document.getElementById('folder').value || null;
     const modified = Date.now();                                        // used by "Date modified" sort
-    if (deck) Object.assign(deck, { title, cards: newCards, folderId, modified }); // update existing
+    const live = decks.find(d => d.id === editingId);
+    if (live) Object.assign(live, { title, cards: newCards, folderId, modified }); // update existing
     else decks.unshift({ id: uid(), title, cards: newCards, folderId, modified }); // add new
     saveDecks();   // write the whole decks array to localStorage
     go('dashboard');
@@ -715,12 +902,22 @@ document.addEventListener('keydown', e => {
 
 /* Header controls */
 document.getElementById('home').onclick = () => { currentFolder = null; go('dashboard'); };
+document.getElementById('syncbtn').onclick = openSync;
 document.getElementById('theme').onclick = () => {
   const dark = document.documentElement.classList.toggle('dark');
   try { localStorage.setItem('deckly:theme', dark ? 'dark' : 'light'); } catch (e) {}
 };
 
+// Ask the browser not to evict our data when disk space runs low. This does NOT
+// stop "Clear browsing data" from deleting it; use Back up for that.
+try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+
 render();
+if (getSync()) syncNow();                 // pull + push on page load
+document.addEventListener('visibilitychange', () => {   // and when you come back to the tab
+  const c = getSync();
+  if (document.visibilityState === 'visible' && c && Date.now() - (c.last || 0) > 30000) syncNow();
+});
 </script>
 </body>
 </html>
