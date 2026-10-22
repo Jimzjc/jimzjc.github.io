@@ -217,7 +217,7 @@ async function syncNow() {
     cfg.last = Date.now(); setSync(cfg);
     setMsg('Synced at ' + new Date(cfg.last).toLocaleTimeString());
     const gi = document.getElementById('sync-gist'); if (gi) gi.value = cfg.gistId;
-    if (view === 'dashboard') render();   // never re-render while editing a form
+    if (view === 'dashboard' || (view === 'quiz' && quiz && quiz.stage === 'setup')) render();   // never re-render while editing or mid-quiz
   } catch (e) { setMsg(e.message || 'Sync failed'); }
   finally { syncing = false; }
 }
@@ -799,6 +799,11 @@ const deckPrint = deck => hashSeed(JSON.stringify(sortedCards(deck).map(c => [c.
 const fmtPrint = p => p.slice(0, 4) + '-' + p.slice(4);
 function fmtTime(sec) { return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0'); }
 
+// Bump this whenever the question-generation algorithm changes. Two devices only
+// produce identical quizzes if they run the same engine version.
+const QUIZ_ENGINE = 2;
+const quizId = qs => hashSeed(JSON.stringify(qs))().toString(16).toUpperCase().padStart(8, '0').slice(0, 6);
+
 // Seconds on the stopwatch: runs up from 0 and freezes once the last answer is given
 const elapsedSec = q => Math.floor(((q.finishedAt || Date.now()) - q.startedAt) / 1000);
 
@@ -820,9 +825,11 @@ function buildSeeded(deck, seed, side) {
 
 function startTimed(deck, seed, side) {
   clearInterval(quiz.timerId);
-  Object.assign(quiz, { timed: true, side, stage: 'q', seed, print: deckPrint(deck), qs: buildSeeded(deck, seed, side),
+  deck = decks.find(d => d.id === deck.id) || deck;   // always use the latest synced copy
+  Object.assign(quiz, { timed: true, side, stage: 'q', seed, print: deckPrint(deck), deck, qs: buildSeeded(deck, seed, side), qid: '',
     i: 0, score: 0, correct: 0, streak: 0, gain: 0, tried: [], done: false, wrong: [], startedAt: Date.now(), finishedAt: 0, elapsed: 0 });
   const q = quiz;
+  q.qid = quizId(q.qs);
   q.timerId = setInterval(() => {            // refresh the stopwatch text
     if (view !== 'quiz' || quiz !== q || q.stage !== 'q' || !q.timed) return clearInterval(q.timerId);
     const el = document.getElementById('qtimer');
@@ -832,7 +839,7 @@ function startTimed(deck, seed, side) {
 }
 
 function timedPanelHTML(q) {
-  const n = Math.min(15, q.deck.cards.length), side = q.sideDraft || first;
+  const n = Math.min(15, q.deck.cards.length), side = q.sideDraft || 'term';
   return `<div class="mt-8 rounded-2xl border border-black/10 dark:border-white/10 bg-white dark:bg-[#16211d] p-5">
     <h2 class="text-lg font-bold">Timed challenge</h2>
     <p class="text-sm opacity-70 mt-1">${n} questions generated from a 6-character seed. Anyone with the same deck and seed gets the same questions in the same order.${q.deck.cards.length < 15 ? ` This deck has fewer than 15 cards, so the quiz has ${n} questions.` : ''}</p>
@@ -845,7 +852,7 @@ function timedPanelHTML(q) {
       <input id="seed" maxlength="6" autocomplete="off" spellcheck="false" placeholder="SEED" aria-label="Seed" class="${input} !w-32 font-mono uppercase tracking-widest" value="${esc(q.seedDraft || '')}">
       <button id="randseed" class="${btnGhost} !py-2.5">Random</button>
     </div>
-    <p class="text-xs opacity-60 mt-3">Deck check: <span class="font-mono font-bold">${fmtPrint(deckPrint(q.deck))}</span>. Compare it with the other person's. If it differs, your decks are not identical yet, so sync first.</p>
+    <p class="text-xs opacity-60 mt-3">Deck check: <span class="font-mono font-bold">${fmtPrint(deckPrint(q.deck))}</span> · Engine v${QUIZ_ENGINE}. Both people must see the same deck check and engine version. If the deck check differs, sync first. If the engine differs, refresh the page to load the newest file.</p>
     <p id="seed-err" class="text-sm text-red-600 dark:text-red-400 mt-2 min-h-[1.25rem]"></p>
     <button id="startseed" class="${btnPrimary}">Start timed quiz</button>
   </div>`;
@@ -862,7 +869,7 @@ function bindTimed(q) {
   document.getElementById('startseed').onclick = () => {
     const seed = seedEl.value.trim().toUpperCase();
     if (!/^[A-Z0-9]{6}$/.test(seed)) { err.textContent = 'The seed must be exactly 6 letters or numbers.'; return; }
-    startTimed(q.deck, seed, q.sideDraft || first);
+    startTimed(q.deck, seed, q.sideDraft || 'term');
   };
 }
 
@@ -880,7 +887,9 @@ function buildQuiz(deck, n) {
 }
 
 function renderQuiz() {
-  const q = quiz, total = q.deck.cards.length;
+  const q = quiz;
+  if (q.stage === 'setup') q.deck = decks.find(d => d.id === q.deck.id) || q.deck;   // freshest synced copy
+  const total = q.deck.cards.length;
   const back = `<button data-qback class="${btnGhost} !py-2">${icon.left} Decks</button>`;
   const finish = () => $app.querySelectorAll('[data-qback]').forEach(b => b.onclick = () => go('dashboard'));
 
@@ -926,7 +935,7 @@ function renderQuiz() {
     $app.innerHTML = `<div class="max-w-2xl mx-auto">
       <div class="flex items-center justify-between mb-4">${back}<span class="text-sm opacity-70">${q.timed ? `<span id="qtimer" class="font-bold tabular-nums mr-3">${fmtTime(elapsedSec(q))}</span>` : ''}Score ${q.score}${q.timed ? ' · Streak ' + q.streak : ''}</span></div>
       <div class="h-1.5 rounded-full bg-black/10 dark:bg-white/10 mb-3 overflow-hidden"><div class="h-full bg-brand dark:bg-brand-light transition-all duration-300" style="width:${(q.i + (over ? 1 : 0)) / q.qs.length * 100}%"></div></div>
-      <p class="text-sm opacity-60 mb-3">Question ${q.i + 1} of ${q.qs.length}</p>
+      <p class="text-sm opacity-60 mb-3">Question ${q.i + 1} of ${q.qs.length}${q.timed ? ` · Quiz ID <span class="font-mono">${q.qid}</span>` : ''}</p>
       <div class="rounded-2xl bg-white dark:bg-[#16211d] border border-black/10 dark:border-white/10 shadow p-6 sm:p-8 mb-5">
         <p class="text-sm opacity-50 mb-2">${sideName(q.side)}</p>
         <p class="text-2xl font-bold break-words">${esc(cur.prompt)}</p>
@@ -985,7 +994,7 @@ function renderQuiz() {
       <p class="text-6xl font-bold my-2 text-brand dark:text-brand-light">${q.timed ? q.score + ' pts' : pct + '%'}</p>
       <p class="text-lg">${q.timed ? q.correct : q.score} of ${q.qs.length} correct${q.timed ? ` · best possible ${q.qs.length * (q.qs.length + 1) / 2} pts` : ''}</p>
       ${q.timed ? `<p class="text-lg font-medium mt-3">Time taken: ${fmtTime(q.elapsed)}</p>
-      <p class="text-sm opacity-70">Seed <span class="font-mono font-bold">${q.seed}</span> · Questions show ${sideName(q.side).toLowerCase()} · Deck check <span class="font-mono">${fmtPrint(q.print)}</span></p>` : ''}
+      <p class="text-sm opacity-70">Seed <span class="font-mono font-bold">${q.seed}</span> · Questions show ${sideName(q.side).toLowerCase()} · Deck check <span class="font-mono">${fmtPrint(q.print)}</span> · Quiz ID <span class="font-mono">${q.qid}</span> · Engine v${QUIZ_ENGINE}</p>` : ''}
     </div>
     ${q.wrong.length ? `<h2 class="text-lg font-bold mt-6 mb-2">Review missed</h2>
       <div class="space-y-2">${q.wrong.map(w => `<div class="p-3 rounded-xl bg-white dark:bg-[#16211d] border border-black/10 dark:border-white/10"><p class="font-medium break-words">${esc(w.prompt)}</p><p class="text-sm text-emerald-700 dark:text-emerald-400 break-words">${esc(w.answer)}</p></div>`).join('')}</div>` : ''}
